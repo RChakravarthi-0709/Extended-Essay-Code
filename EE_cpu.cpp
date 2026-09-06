@@ -6,14 +6,6 @@
 #include <openssl/evp.h>
 #include <openssl/crypto.h>
 
-// Utility: check if AES-NI is supported
-bool aesni_supported() {
-    // OPENSSL_ia32cap_P is defined by OpenSSL to expose CPU feature bits
-    extern unsigned long long OPENSSL_ia32cap_P[];
-    unsigned long long caps = OPENSSL_ia32cap_P[1];
-    return (caps & (1ULL << 57)); // Bit 57 = AES-NI
-}
-
 int main() {
     std::vector<size_t> payloadSizes = {
         16 * 1024ULL,        // 16 KiB
@@ -24,11 +16,6 @@ int main() {
         1ULL * 1024 * 1024 * 1024 // 1 GiB
     };
 
-    if (aesni_supported()) {
-        std::cout << "AES-NI is supported and OpenSSL will use hardware acceleration.\n";
-    } else {
-        std::cout << "AES-NI not available — OpenSSL will fall back to software AES.\n";
-    }
 
     std::mt19937 rng(std::random_device{}());
     std::ofstream csv("cpu_results.csv");
