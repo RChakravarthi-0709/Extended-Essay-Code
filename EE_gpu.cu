@@ -1,18 +1,19 @@
-// Reference implementation for an IB Computer Science EE benchmark.
+// GPU-only benchmark for an IB Computer Science EE.
 //
 // The GPU performs AES-128 key expansion, counter-mode encryption AND
-// GHASH/tag generation. OpenSSL is used only for CPU baseline and validation.
+// GHASH/tag generation. OpenSSL is used only as an untimed correctness reference;
+// CPU latency and throughput are not benchmarked or written to the results.
 // This is intended as a transparent educational implementation, not production
 // cryptographic software. It uses a straightforward bit-serial GF(2^128)
 // multiplier; it is correct in structure but may be slow compared with highly
 // optimized implementations such as OpenSSL.
 //
-// Compile (Linux, with CUDA toolkit and OpenSSL development files installed):
-//   nvcc -O3 -std=c++17 EE_gpu_aes_gcm_option1.cu -o EE_gpu_aes_gcm_option1 -lcrypto
+// Compile from the x64 Native Tools Command Prompt for Visual Studio on Windows:
+//   nvcc -O3 -std=c++17 -arch=sm_86 -I"%USERPROFILE%\vcpkg\installed\x64-windows\include" "EE_gpu_aes_gcm_gpu_only.cu" -o "EE_gpu_only.exe" "%USERPROFILE%\vcpkg\installed\x64-windows\lib\libcrypto.lib"
 // Smoke test 16 KiB and 8 MiB payloads, one trial each:
-//   ./EE_gpu_aes_gcm_option1 --smoke
+//   EE_gpu_only.exe --smoke
 // Full run: six payload sizes, 50 trials each:
-//   ./EE_gpu_aes_gcm_option1
+//   EE_gpu_only.exe
 //
 // Payload sizes in this file are all multiples of 16*256 bytes. This lets the
 // chunked GHASH reduction use equal-sized chunks at every non-final reduction
@@ -330,25 +331,23 @@ __global__ void finish_gcm_tag_kernel(const unsigned char* ciphertextHash,
     for (int i = 0; i < 16; ++i) tag[i] = static_cast<unsigned char>(y[i] ^ tagMask[i]);
 }
 
-struct CpuResult {
-    double latencyUs;
+struct ReferenceResult {
     std::vector<unsigned char> ciphertext;
     std::array<unsigned char, 16> tag;
 };
 
-static CpuResult openssl_aes_gcm(const std::vector<unsigned char>& plaintext,
+static ReferenceResult openssl_aes_gcm_reference(const std::vector<unsigned char>& plaintext,
                                  const std::array<unsigned char, 16>& key,
                                  const std::array<unsigned char, 12>& iv) {
     if (plaintext.size() > static_cast<size_t>(INT32_MAX)) {
         throw std::runtime_error("Payload exceeds EVP_EncryptUpdate's int-length limit in this example.");
     }
 
-    CpuResult result;
+    ReferenceResult result;
     result.ciphertext.resize(plaintext.size() + AES_BLOCK_SIZE);
     int outLen = 0;
     int finalLen = 0;
 
-    const auto start = std::chrono::steady_clock::now();
     EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
     if (!ctx) throw std::runtime_error("EVP_CIPHER_CTX_new failed");
 
@@ -362,14 +361,12 @@ static CpuResult openssl_aes_gcm(const std::vector<unsigned char>& plaintext,
     ok = ok && EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_GET_TAG,
                                   static_cast<int>(result.tag.size()), result.tag.data()) == 1;
     EVP_CIPHER_CTX_free(ctx);
-    const auto end = std::chrono::steady_clock::now();
 
     if (!ok) throw std::runtime_error("OpenSSL AES-GCM encryption failed");
     if (static_cast<size_t>(outLen + finalLen) != plaintext.size()) {
         throw std::runtime_error("Unexpected ciphertext length from OpenSSL");
     }
     result.ciphertext.resize(plaintext.size());
-    result.latencyUs = std::chrono::duration<double, std::micro>(end - start).count();
     return result;
 }
 
@@ -396,10 +393,9 @@ int main(int argc, char** argv) {
               };
 
         std::mt19937 rng(std::random_device{}());
-        std::ofstream csv("aes_gcm_cpu_gpu_results.csv");
+        std::ofstream csv("aes_gcm_gpu_only_results.csv");
         if (!csv) throw std::runtime_error("Could not open output CSV");
-        csv << "PayloadSizeBytes,Trial,CPU_Latency_us,CPU_Throughput_GiB_s,"
-               "GPU_KernelPipeline_us,GPU_KernelPipeline_Throughput_GiB_s,"
+        csv << "PayloadSizeBytes,Trial,GPU_KernelPipeline_us,GPU_KernelPipeline_Throughput_GiB_s,"
                "GPU_EndToEnd_us,GPU_EndToEnd_Throughput_GiB_s,Validation\n";
 
         for (size_t payloadSize : payloadSizes) {
@@ -449,9 +445,9 @@ int main(int argc, char** argv) {
                 for (auto& b : key) b = static_cast<unsigned char>(rng() & 0xff);
                 for (auto& b : iv) b = static_cast<unsigned char>(rng() & 0xff);
 
-                // Correct reference result and CPU baseline. The timer includes OpenSSL context setup,
-                // encryption finalisation and authentication-tag retrieval.
-                CpuResult cpu = openssl_aes_gcm(plaintext, key, iv);
+                // Generate a correctness reference with OpenSSL. This is NOT a CPU benchmark:
+                // no CPU timing is recorded, and this call occurs before either GPU timer starts.
+                ReferenceResult reference = openssl_aes_gcm_reference(plaintext, key, iv);
 
                 std::vector<unsigned char> gpuCiphertext(payloadSize);
                 std::array<unsigned char, 16> gpuTag{};
@@ -508,8 +504,8 @@ int main(int argc, char** argv) {
                 const auto e2eEnd = std::chrono::steady_clock::now();
                 const double gpuE2eUs = std::chrono::duration<double, std::micro>(e2eEnd - e2eStart).count();
 
-                const bool ciphertextMatches = (gpuCiphertext == cpu.ciphertext);
-                const bool tagMatches = (gpuTag == cpu.tag);
+                const bool ciphertextMatches = (gpuCiphertext == reference.ciphertext);
+                const bool tagMatches = (gpuTag == reference.tag);
                 const bool valid = ciphertextMatches && tagMatches;
                 if (!valid) {
                     std::cerr << "Validation failed for payload=" << payloadSize << ", trial=" << trial
@@ -518,15 +514,13 @@ int main(int argc, char** argv) {
                     throw std::runtime_error("GPU result did not match OpenSSL AES-GCM. Do not use these benchmark results.");
                 }
 
-                const double cpuThr = throughput_gib_s(payloadSize, cpu.latencyUs);
                 const double kernelThr = throughput_gib_s(payloadSize, gpuKernelUs);
                 const double e2eThr = throughput_gib_s(payloadSize, gpuE2eUs);
-                csv << payloadSize << ',' << trial << ',' << cpu.latencyUs << ',' << cpuThr << ','
-                    << gpuKernelUs << ',' << kernelThr << ',' << gpuE2eUs << ',' << e2eThr << ",PASS\n";
+                csv << payloadSize << ',' << trial << ',' << gpuKernelUs << ',' << kernelThr << ','
+                    << gpuE2eUs << ',' << e2eThr << ",PASS\n";
                 csv.flush();
 
-                std::cout << "  Trial " << trial << ": validation PASS; CPU " << cpu.latencyUs
-                          << " us, GPU kernel pipeline " << gpuKernelUs
+                std::cout << "  Trial " << trial << ": validation PASS; GPU kernel pipeline " << gpuKernelUs
                           << " us, GPU end-to-end " << gpuE2eUs << " us\n";
             }
 
@@ -546,7 +540,7 @@ int main(int argc, char** argv) {
         }
 
         csv.close();
-        std::cout << "Finished. Results written to aes_gcm_cpu_gpu_results.csv\n";
+        std::cout << "Finished. Results written to aes_gcm_gpu_only_results.csv\n";
         return 0;
     } catch (const std::exception& ex) {
         std::cerr << "ERROR: " << ex.what() << "\n";
