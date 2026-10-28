@@ -42,21 +42,66 @@ int main() {
 
 
             std::vector<unsigned char> ciphertext(payloadSize + 16);
-            int len;
 
+            std::vector<unsigned char> tag(16);
 
-            auto start = std::chrono::high_resolution_clock::now();
-
+            int len = 0;
+            int final_len = 0;
 
             EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
-            EVP_EncryptInit_ex(ctx, EVP_aes_128_gcm(), nullptr, key.data(), iv.data());
-            EVP_EncryptUpdate(ctx, ciphertext.data(), &len, plaintext.data(), plaintext.size());
+
+            if (!ctx) {
+                std::cerr << "Failed to create OpenSSL context\n";
+                return 1;
+            }
+
+            auto start = std::chrono::steady_clock::now();
+
+            bool ok =
+                EVP_EncryptInit_ex(
+                    ctx, EVP_aes_128_gcm(), nullptr,
+                    key.data(), iv.data()
+                ) == 1;
+
+            if (ok) {
+                ok = EVP_EncryptUpdate(
+                    ctx, ciphertext.data(), &len,
+                    plaintext.data(),
+                    static_cast<int>(plaintext.size())
+                ) == 1;
+            }
+
+            if (ok) {
+                ok = EVP_EncryptFinal_ex(
+                    ctx, ciphertext.data() + len, &final_len
+                ) == 1;
+            }
+
+            if (ok) {
+                ok = EVP_CIPHER_CTX_ctrl(
+                    ctx, EVP_CTRL_GCM_GET_TAG, 16, tag.data()
+                ) == 1;
+            }
+
+            auto end = std::chrono::steady_clock::now();
+
             EVP_CIPHER_CTX_free(ctx);
 
+            if (!ok) {
+                std::cerr << "AES-GCM encryption failed\n";
+                return 1;
+            }
 
-            auto end = std::chrono::high_resolution_clock::now();
-            auto latency_us = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
-            double throughput = static_cast<double>(payloadSize) / (latency_us / 1e6);
+            double latency_us =
+                std::chrono::duration<double, std::micro>(
+                    end - start
+                ).count();
+
+            double throughput =
+                static_cast<double>(payloadSize) /
+                (latency_us / 1e6);
+
+            ciphertext.resize(len + final_len);
 
 
             latencies.push_back(latency_us);
